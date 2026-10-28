@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+# Имитация grub2-mkconfig для демо-режима и тестов: пишет файл, указанный в -o.
+import sys
+
+out = sys.argv[sys.argv.index("-o") + 1] if "-o" in sys.argv else None
+print("Generating grub configuration file ...")
+print("Adding boot menu entry for UEFI Firmware Settings ...")
+print("done")
+if out:
+    with open(out, "w") as f:
+        f.write("# демо: grub.cfg, сгенерирован в режиме BLS\nblscfg\n")

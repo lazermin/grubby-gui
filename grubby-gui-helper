@@ -1,0 +1,307 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+grubby-gui-helper — привилегированный помощник для grubby-gui.
+
+Запускается один раз за сессию через pkexec (или напрямую, если GUI уже
+работает от root). Читает из stdin JSON-запросы по одному на строку и
+отвечает в stdout:
+
+  {"id": 1, "argv": ["--info=ALL"]}  -> {"id": 1, "rc": 0, "out": "...", "err": "..."}
+  {"id": 2, "op": "bls-status"}      -> {"id": 2, "rc": 0, "data": {...}}
+  {"id": 3, "op": "enable-bls"}      -> {"id": 3, "rc": 0, "out": "...", "err": "..."}
+
+Разрешено только:
+  * grubby с ключами из белого списка (без shell);
+  * чтение состояния BLS;
+  * переход на BLS: GRUB_ENABLE_BLSCFG=true в /etc/default/grub
+    и grub2-mkconfig -o <grub.cfg> — с резервными копиями и откатом.
+
+Совместим с Python 3.6+.
+"""
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+PROTOCOL_VERSION = 2
+
+VALUE_OPTS = (
+    "--info", "--set-default", "--set-default-index", "--update-kernel",
+    "--args", "--remove-args", "--add-kernel", "--remove-kernel",
+    "--initrd", "--extra-initrd", "--title",
+)
+FLAG_OPTS = (
+    "--default-kernel", "--default-index", "--default-title", "--copy-default",
+    "--make-default", "--no-etc-grub-update", "--help",
+)
+
+SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+ENV = {"PATH": SAFE_PATH, "LANG": "C", "LC_ALL": "C"}
+
+DEFAULT_GRUB = "/etc/default/grub"
+ENTRIES_DIR = "/boot/loader/entries"
+BIOS_CFG = "/boot/grub2/grub.cfg"
+
+
+class Ctx(object):
+    """Пути и программы. Подмены (--grubby, --fakeroot, --mkconfig) разрешены
+    только без прав root — для демо-режима и тестов."""
+
+    def __init__(self, args):
+        self.grubby_override = self.fakeroot = self.mkconfig_override = None
+        it = iter(args)
+        for a in it:
+            if a == "--grubby":
+                self.grubby_override = next(it, None)
+            elif a == "--fakeroot":
+                self.fakeroot = next(it, None)
+            elif a == "--mkconfig":
+                self.mkconfig_override = next(it, None)
+        if os.geteuid() == 0:
+            self.grubby_override = self.fakeroot = self.mkconfig_override = None
+
+    def path(self, p):
+        if self.fakeroot:
+            return os.path.join(self.fakeroot, p.lstrip("/"))
+        return p
+
+    def unpath(self, p):
+        """Путь для показа пользователю (без префикса fakeroot)."""
+        if self.fakeroot and p.startswith(self.fakeroot):
+            return "/" + os.path.relpath(p, self.fakeroot)
+        return p
+
+    def grubby(self):
+        return self.grubby_override or shutil.which("grubby", path=SAFE_PATH)
+
+    def mkconfig(self):
+        if self.mkconfig_override:
+            return self.mkconfig_override
+        return shutil.which("grub2-mkconfig", path=SAFE_PATH) or \
+            shutil.which("grub-mkconfig", path=SAFE_PATH)
+
+
+# ── /etc/default/grub ───────────────────────────────────────────────────────
+def read_blscfg(text):
+    """Значение GRUB_ENABLE_BLSCFG (последнее незакомментированное) или None."""
+    val = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("export "):
+            s = s[len("export "):].strip()
+        if s.startswith("GRUB_ENABLE_BLSCFG="):
+            val = s.split("=", 1)[1].split("#", 1)[0].strip().strip('"').strip("'")
+    return val
+
+
+def set_blscfg(text, value="true"):
+    """Вернуть текст с GRUB_ENABLE_BLSCFG=value (заменить или дописать)."""
+    out, done = [], False
+    for line in text.splitlines():
+        s = line.strip()
+        bare = s[len("export "):].strip() if s.startswith("export ") else s
+        if bare.startswith("GRUB_ENABLE_BLSCFG="):
+            out.append("GRUB_ENABLE_BLSCFG=%s" % value)
+            done = True
+        else:
+            out.append(line)
+    if not done:
+        out.append("GRUB_ENABLE_BLSCFG=%s" % value)
+    return "\n".join(out) + "\n"
+
+
+def is_stub_cfg(path):
+    """grub.cfg на ESP в новых Fedora/RHEL 9 — заглушка, подключающая /boot/grub2/grub.cfg."""
+    try:
+        if os.path.getsize(path) > 4096:
+            return False
+        with open(path) as f:
+            t = f.read()
+        return "configfile" in t
+    except OSError:
+        return False
+
+
+def grub_cfg_target(ctx):
+    """Куда писать grub.cfg: на UEFI без заглушки — в ESP, иначе /boot/grub2/grub.cfg."""
+    if os.path.isdir(ctx.path("/sys/firmware/efi")):
+        cands = sorted(glob.glob(ctx.path("/boot/efi/EFI/*/grub.cfg")))
+        cands = [c for c in cands if os.path.basename(os.path.dirname(c)).upper() != "BOOT"]
+        real = [c for c in cands if not is_stub_cfg(c)]
+        if real:
+            return real[0]
+    return ctx.path(BIOS_CFG)
+
+
+def bls_status(ctx):
+    dg = ctx.path(DEFAULT_GRUB)
+    data = {"default_grub": DEFAULT_GRUB, "default_grub_exists": os.path.exists(dg),
+            "blscfg": None, "entries_dir": ENTRIES_DIR, "entries": 0,
+            "efi": os.path.isdir(ctx.path("/sys/firmware/efi")),
+            "grub_cfg": ctx.unpath(grub_cfg_target(ctx)),
+            "mkconfig": ctx.mkconfig()}
+    if data["default_grub_exists"]:
+        with open(dg) as f:
+            data["blscfg"] = read_blscfg(f.read())
+    data["entries"] = len(glob.glob(os.path.join(ctx.path(ENTRIES_DIR), "*.conf")))
+    if data["mkconfig"]:
+        data["mkconfig"] = ctx.unpath(data["mkconfig"])
+    return data
+
+
+def atomic_write(path, text):
+    st = os.stat(path)
+    tmp = path + ".grubby-gui.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, st.st_mode & 0o7777)
+    try:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def enable_bls(ctx):
+    log = []
+    dg = ctx.path(DEFAULT_GRUB)
+    if not os.path.exists(dg):
+        return {"rc": 1, "out": "", "err": "Файл %s не найден." % DEFAULT_GRUB}
+    mk = ctx.mkconfig()
+    if not mk:
+        return {"rc": 1, "out": "", "err": "Не найден grub2-mkconfig (пакет grub2-tools)."}
+    entries = glob.glob(os.path.join(ctx.path(ENTRIES_DIR), "*.conf"))
+    if not entries:
+        return {"rc": 1, "out": "",
+                "err": "В %s нет записей (*.conf) — после перехода меню GRUB было бы "
+                       "пустым. Переход отменён." % ENTRIES_DIR}
+    cfg = grub_cfg_target(ctx)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    with open(dg) as f:
+        old = f.read()
+    bak = "%s.grubby-gui-%s.bak" % (dg, stamp)
+    shutil.copy2(dg, bak)
+    log.append("Резервная копия: %s" % ctx.unpath(bak))
+    cfg_bak = None
+    if os.path.exists(cfg):
+        cfg_bak = "%s.grubby-gui-%s.bak" % (cfg, stamp)
+        shutil.copy2(cfg, cfg_bak)
+        log.append("Резервная копия: %s" % ctx.unpath(cfg_bak))
+
+    new = set_blscfg(old, "true")
+    if new != old:
+        atomic_write(dg, new)
+        log.append("%s: GRUB_ENABLE_BLSCFG=true" % DEFAULT_GRUB)
+    else:
+        log.append("%s: GRUB_ENABLE_BLSCFG уже true" % DEFAULT_GRUB)
+
+    cmd = [mk, "-o", cfg]
+    log.append("# %s -o %s" % (ctx.unpath(mk), ctx.unpath(cfg)))
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True,
+                           env=ENV, timeout=300)
+        rc, out = p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        rc, out = -1, str(e)
+    if out.strip():
+        log.append(out.rstrip())
+
+    if rc != 0:
+        # откат: вернуть /etc/default/grub и grub.cfg из резервных копий
+        shutil.copy2(bak, dg)
+        if cfg_bak:
+            shutil.copy2(cfg_bak, cfg)
+        log.append("Ошибка grub2-mkconfig (код %s) — изменения откачены." % rc)
+        return {"rc": rc or 1, "out": "\n".join(log), "err": "grub2-mkconfig завершился с ошибкой"}
+    log.append("Готово: загрузчик переведён в режим BLS.")
+    return {"rc": 0, "out": "\n".join(log), "err": ""}
+
+
+# ── grubby ──────────────────────────────────────────────────────────────────
+def validate(argv):
+    if not isinstance(argv, list) or not argv:
+        return "пустой список аргументов"
+    for a in argv:
+        if not isinstance(a, str):
+            return "аргумент не является строкой"
+        if "\n" in a or "\r" in a or "\x00" in a:
+            return "недопустимые символы в аргументе"
+        if a in FLAG_OPTS:
+            continue
+        if a.split("=", 1)[0] in VALUE_OPTS and "=" in a:
+            continue
+        return "ключ не разрешён: %s" % a
+    return None
+
+
+def run_grubby(ctx, argv):
+    problem = validate(argv)
+    if problem:
+        return {"rc": -1, "out": "", "err": problem}
+    g = ctx.grubby()
+    if not g:
+        return {"rc": 127, "out": "", "err": "grubby не найден. Установите: dnf install grubby"}
+    try:
+        p = subprocess.run([g] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True,
+                           env=ENV, timeout=180)
+        return {"rc": p.returncode, "out": p.stdout, "err": p.stderr}
+    except subprocess.TimeoutExpired:
+        return {"rc": -1, "out": "", "err": "grubby не ответил за 180 с"}
+    except OSError as e:
+        return {"rc": -1, "out": "", "err": str(e)}
+
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def handle(ctx, req):
+    op = req.get("op")
+    if op is None:
+        return run_grubby(ctx, req.get("argv"))
+    try:
+        if op == "bls-status":
+            return {"rc": 0, "data": bls_status(ctx)}
+        if op == "enable-bls":
+            return enable_bls(ctx)
+    except (OSError, IOError) as e:
+        return {"rc": -1, "out": "", "err": str(e)}
+    return {"rc": -1, "out": "", "err": "неизвестная операция: %s" % op}
+
+
+def main():
+    ctx = Ctx(sys.argv[1:])
+    send({"ready": True, "protocol": PROTOCOL_VERSION, "uid": os.geteuid(),
+          "grubby": ctx.grubby()})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                raise ValueError
+        except ValueError:
+            send({"id": None, "rc": -1, "out": "", "err": "неверный JSON"})
+            continue
+        res = handle(ctx, req)
+        res["id"] = req.get("id")
+        send(res)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass

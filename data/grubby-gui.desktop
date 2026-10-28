@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=GRUB2 Boot Manager
+Name[ru]=Менеджер загрузки GRUB2
+GenericName=Boot loader configuration
+GenericName[ru]=Настройка загрузчика
+Comment=Manage GRUB2 boot entries and kernel parameters (grubby GUI)
+Comment[ru]=Ядро по умолчанию, параметры ядра, записи меню GRUB2 и переход на BLS (оболочка grubby)
+Exec=grubby-gui
+Icon=grubby-gui
+Terminal=false
+Categories=System;Settings;
+Keywords=grub;grub2;grubby;boot;kernel;bootloader;загрузчик;ядро;
+StartupNotify=true
